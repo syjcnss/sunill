@@ -1,7 +1,9 @@
-pragma solidity 0.5.17;
+// SPDX-License-Identifier: BSD-3-Clause
+pragma solidity 0.8.17;
 
 import "./MToken.sol";
-import "./PriceOracle.sol";
+import "./Oracles/PriceOracle.sol";
+import "./MultiRewardDistributor/MultiRewardDistributor.sol";
 
 contract UnitrollerAdminStorage {
     /**
@@ -43,11 +45,6 @@ contract ComptrollerVXStorage is UnitrollerAdminStorage {
     uint public liquidationIncentiveMantissa;
 
     /**
-     * @notice Max number of assets a single account can participate in (borrow or use as collateral)
-     */
-    uint public maxAssets;
-
-    /**
      * @notice Per-account mapping of "assets you are in", capped by maxAssets
      */
     mapping(address => MToken[]) public accountAssets;
@@ -65,9 +62,6 @@ contract ComptrollerVXStorage is UnitrollerAdminStorage {
 
         /// @notice Per-market mapping of "accounts in this asset"
         mapping(address => bool) accountMembership;
-
-        /// @notice Whether or not this market receives WELL
-        bool isWelled;
     }
 
     /**
@@ -76,15 +70,12 @@ contract ComptrollerVXStorage is UnitrollerAdminStorage {
      */
     mapping(address => Market) public markets;
 
-
     /**
      * @notice The Pause Guardian can pause certain actions as a safety mechanism.
      *  Actions which allow users to remove their own assets cannot be paused.
      *  Liquidation / seizing / transfer can only be paused globally, not by market.
      */
     address public pauseGuardian;
-    bool public _mintGuardianPaused;
-    bool public _borrowGuardianPaused;
     bool public transferGuardianPaused;
     bool public seizeGuardianPaused;
     mapping(address => bool) public mintGuardianPaused;
@@ -107,33 +98,17 @@ contract ComptrollerVXStorage is UnitrollerAdminStorage {
         uint32 timestamp;
     }
 
-    /// @notice The rate at which the flywheel distributes reward, per timestamp
-    mapping(uint8 => uint) rewardRate;
-
-    /// @notice The portion of supply reward rate that each market currently receives
-    mapping(uint8 => mapping(address => uint)) public supplyRewardSpeeds;
-
-    /// @notice The portion of borrow reward rate that each market currently receives
-    mapping(uint8 => mapping(address => uint)) public borrowRewardSpeeds;
-
-    /// @notice The WELL/GLMR market supply state for each market
-    mapping(uint8 => mapping(address => RewardMarketState)) public rewardSupplyState;
-
-    /// @notice The WELL/GLMR market borrow state for each market
-    mapping(uint8 =>mapping(address => RewardMarketState)) public rewardBorrowState;
-
-    /// @notice The WELL/GLMR borrow index for each market for each supplier as of the last time they accrued reward
-    mapping(uint8 => mapping(address => mapping(address => uint))) public rewardSupplierIndex;
-
-    /// @notice The WELL/GLMR borrow index for each market for each borrower as of the last time they accrued reward
-    mapping(uint8 => mapping(address => mapping(address => uint))) public rewardBorrowerIndex;
-
-    /// @notice The WELL/GLMR accrued but not yet transferred to each user
-    mapping(uint8 => mapping(address => uint)) public rewardAccrued;
-
-    /// @notice WELL token contract address
-    address public wellAddress;
-
     /// @notice Reentrant status, 0: not entered, 1: entered
     uint256 internal _locked;
+}
+
+contract ComptrollerV2Storage is ComptrollerVXStorage {
+    /// @notice The supplyCapGuardian can set supplyCaps to any number for any market. Lowering the supply cap could disable supplying to the given market.
+    address public supplyCapGuardian;
+
+    /// @notice Supply caps enforced by mintAllowed for each cToken address. Defaults to zero which corresponds to unlimited supplying.
+    mapping(address => uint) public supplyCaps;
+
+    /// @notice The Reward distributor used to emit protocol rewards
+    MultiRewardDistributor public rewardDistributor;
 }

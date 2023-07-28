@@ -1,18 +1,18 @@
-pragma solidity 0.5.17;
+// SPDX-License-Identifier: BSD-3-Clause
+pragma solidity 0.8.17;
 
 import "./MToken.sol";
 import "./ErrorReporter.sol";
-import "./PriceOracle.sol";
+import "./Oracles/PriceOracle.sol";
 import "./ComptrollerInterface.sol";
 import "./ComptrollerStorage.sol";
 import "./Unitroller.sol";
-import "./Governance/Well.sol";
 
 /**
  * @title Moonwell's Comptroller Contract
  * @author Moonwell
  */
-contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerErrorReporter, ExponentialNoError {
+contract Comptroller is ComptrollerV2Storage, ComptrollerInterface, ComptrollerErrorReporter, ExponentialNoError {
     /// @notice Emitted when an admin supports a market
     event MarketListed(MToken mToken);
 
@@ -43,32 +43,20 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     /// @notice Emitted when an action is paused on a market
     event ActionPaused(MToken mToken, string action, bool pauseState);
 
-    /// @notice Emitted when supply reward speed is updated
-    event SupplyRewardSpeedUpdated(uint8 rewardToken, MToken indexed mToken, uint newSupplyRewardSpeed);
-
-    /// @notice Emitted when borrow reward speed is updated
-    event BorrowRewardSpeedUpdated(uint8 rewardToken, MToken indexed mToken, uint newBorrowRewardSpeed);
-
-    /// @notice Emitted when a new WELL speed is set for a contributor
-    event ContributorWellSpeedUpdated(address indexed contributor, uint newSpeed);
-
-    /// @notice Emitted when WELL or GLMR is distributed to a borrower
-    event DistributedBorrowerReward(uint8 indexed tokenType, MToken indexed mToken, address indexed borrower, uint wellDelta, uint wellBorrowIndex);
-
-    /// @notice Emitted when WELL or GLMR is distributed to a supplier
-    event DistributedSupplierReward(uint8 indexed tokenType, MToken indexed mToken, address indexed supplier, uint wellDelta, uint wellSupplyIndex);
-
     /// @notice Emitted when borrow cap for a mToken is changed
     event NewBorrowCap(MToken indexed mToken, uint newBorrowCap);
 
     /// @notice Emitted when borrow cap guardian is changed
     event NewBorrowCapGuardian(address oldBorrowCapGuardian, address newBorrowCapGuardian);
 
-    /// @notice Emitted when WELL is granted by admin
-    event WellGranted(address recipient, uint amount);
+    /// @notice Emitted when supply cap for a mToken is changed
+    event NewSupplyCap(MToken indexed mToken, uint newSupplyCap);
 
-    /// @notice The initial WELL and GLMR index for a market
-    uint224 public constant initialIndexConstant = 1e36;
+    /// @notice Emitted when supply cap guardian is changed
+    event NewSupplyCapGuardian(address oldSupplyCapGuardian, address newSupplyCapGuardian);
+
+    /// @notice Emitted when reward distributor is changed
+    event NewRewardDistributor(MultiRewardDistributor oldRewardDistributor, MultiRewardDistributor newRewardDistributor);
 
     // closeFactorMantissa must be strictly greater than this value
     uint internal constant closeFactorMinMantissa = 0.05e18; // 0.05
@@ -79,17 +67,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     // No collateralFactorMantissa may exceed this value
     uint internal constant collateralFactorMaxMantissa = 0.9e18; // 0.9
 
-    // reward token type to show WELL or GLMR
-    uint8 public constant rewardWell = 0;
-    uint8 public constant rewardGlmr = 1;
-
-    // The amount of gas to use when making a native asset transfer.
-    uint16 public gasAmount = 2300;
-
-    /// @notice Emitted when the admin changes the gas amount.
-    event NewGasAmount(uint16 oldGasAmount, uint16 newGasAmount);
-
-    constructor() public {
+    constructor() {
         admin = msg.sender;
     }
 
@@ -121,7 +99,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param mTokens The list of addresses of the mToken markets to be enabled
      * @return Success indicator for whether each corresponding market was entered
      */
-    function enterMarkets(address[] memory mTokens) public returns (uint[] memory) {
+    function enterMarkets(address[] memory mTokens) override public returns (uint[] memory) {
         uint len = mTokens.length;
 
         uint[] memory results = new uint[](len);
@@ -173,7 +151,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param mTokenAddress The address of the asset to be removed
      * @return Whether or not the account successfully exited the market
      */
-    function exitMarket(address mTokenAddress) external returns (uint) {
+    function exitMarket(address mTokenAddress) override external returns (uint) {
         MToken mToken = MToken(mTokenAddress);
         /* Get sender tokensHeld and amountOwed underlying from the mToken */
         (uint oErr, uint tokensHeld, uint amountOwed, ) = mToken.getAccountSnapshot(msg.sender);
@@ -218,7 +196,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         // copy last item in list to location of item to be removed, reduce length by 1
         MToken[] storage storedList = accountAssets[msg.sender];
         storedList[assetIndex] = storedList[storedList.length - 1];
-        storedList.length--;
+        storedList.pop();
 
         emit MarketExited(mToken, msg.sender);
 
@@ -234,7 +212,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param mintAmount The amount of underlying being supplied to the market in exchange for tokens
      * @return 0 if the mint is allowed, otherwise a semi-opaque error code (See ErrorReporter.sol)
      */
-    function mintAllowed(address mToken, address minter, uint mintAmount) external returns (uint) {
+    function mintAllowed(address mToken, address minter, uint mintAmount) override external returns (uint) {
         // Pausing is a very serious situation - we revert to sound the alarms
         require(!mintGuardianPaused[mToken], "mint is paused");
 
@@ -245,29 +223,22 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
             return uint(Error.MARKET_NOT_LISTED);
         }
 
+        uint supplyCap = supplyCaps[mToken];
+        // Supply cap of 0 corresponds to unlimited supplying
+        if (supplyCap != 0) {
+            uint totalCash = MToken(mToken).getCash();
+            uint totalBorrows = MToken(mToken).totalBorrows();
+            uint totalReserves = MToken(mToken).totalReserves();
+            // totalSupplies = totalCash + totalBorrows - totalReserves
+            uint totalSupplies = sub_(add_(totalCash, totalBorrows), totalReserves);
+
+            uint nextTotalSupplies = add_(totalSupplies, mintAmount);
+            require(nextTotalSupplies < supplyCap, "market supply cap reached");
+        }
+
         // Keep the flywheel moving
         updateAndDistributeSupplierRewardsForToken(mToken, minter);
         return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates mint and reverts on rejection. May emit logs.
-     * @param mToken Asset being minted
-     * @param minter The address minting the tokens
-     * @param actualMintAmount The amount of the underlying asset being minted
-     * @param mintTokens The number of tokens being minted
-     */
-    function mintVerify(address mToken, address minter, uint actualMintAmount, uint mintTokens) external {
-        // Shh - currently unused
-        mToken;
-        minter;
-        actualMintAmount;
-        mintTokens;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
     }
 
     /**
@@ -277,7 +248,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param redeemTokens The number of mTokens to exchange for the underlying asset in the market
      * @return 0 if the redeem is allowed, otherwise a semi-opaque error code (See ErrorReporter.sol)
      */
-    function redeemAllowed(address mToken, address redeemer, uint redeemTokens) external returns (uint) {
+    function redeemAllowed(address mToken, address redeemer, uint redeemTokens) override external returns (uint) {
         uint allowed = redeemAllowedInternal(mToken, redeemer, redeemTokens);
         if (allowed != uint(Error.NO_ERROR)) {
             return allowed;
@@ -318,7 +289,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param redeemAmount The amount of the underlying asset being redeemed
      * @param redeemTokens The number of tokens being redeemed
      */
-    function redeemVerify(address mToken, address redeemer, uint redeemAmount, uint redeemTokens) external {
+    function redeemVerify(address mToken, address redeemer, uint redeemAmount, uint redeemTokens) override pure external {
         // Shh - currently unused
         mToken;
         redeemer;
@@ -336,7 +307,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param borrowAmount The amount of underlying the account would borrow
      * @return 0 if the borrow is allowed, otherwise a semi-opaque error code (See ErrorReporter.sol)
      */
-    function borrowAllowed(address mToken, address borrower, uint borrowAmount) external returns (uint) {
+    function borrowAllowed(address mToken, address borrower, uint borrowAmount) override external returns (uint) {
         // Pausing is a very serious situation - we revert to sound the alarms
         require(!borrowGuardianPaused[mToken], "borrow is paused");
 
@@ -349,9 +320,9 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
             require(msg.sender == mToken, "sender must be mToken");
 
             // attempt to add borrower to the market
-            Error err = addToMarketInternal(MToken(msg.sender), borrower);
-            if (err != Error.NO_ERROR) {
-                return uint(err);
+            Error addToMarketErr = addToMarketInternal(MToken(msg.sender), borrower);
+            if (addToMarketErr != Error.NO_ERROR) {
+                return uint(addToMarketErr);
             }
 
             // it should be impossible to break the important invariant
@@ -361,7 +332,6 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         if (oracle.getUnderlyingPrice(MToken(mToken)) == 0) {
             return uint(Error.PRICE_ERROR);
         }
-
 
         uint borrowCap = borrowCaps[mToken];
         // Borrow cap of 0 corresponds to unlimited borrowing
@@ -380,28 +350,9 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         }
 
         // Keep the flywheel moving
-        Exp memory borrowIndex = Exp({mantissa: MToken(mToken).borrowIndex()});
-        updateAndDistributeBorrowerRewardsForToken(mToken, borrower, borrowIndex);
+        updateAndDistributeBorrowerRewardsForToken(mToken, borrower);
 
         return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates borrow and reverts on rejection. May emit logs.
-     * @param mToken Asset whose underlying is being borrowed
-     * @param borrower The address borrowing the underlying
-     * @param borrowAmount The amount of the underlying asset requested to borrow
-     */
-    function borrowVerify(address mToken, address borrower, uint borrowAmount) external {
-        // Shh - currently unused
-        mToken;
-        borrower;
-        borrowAmount;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
     }
 
     /**
@@ -416,7 +367,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         address mToken,
         address payer,
         address borrower,
-        uint repayAmount) external returns (uint) {
+        uint repayAmount) override external returns (uint) {
         // Shh - currently unused
         payer;
         borrower;
@@ -427,36 +378,9 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         }
 
         // Keep the flywheel moving
-        Exp memory borrowIndex = Exp({mantissa: MToken(mToken).borrowIndex()});
-        updateAndDistributeBorrowerRewardsForToken(mToken, borrower, borrowIndex);
+        updateAndDistributeBorrowerRewardsForToken(mToken, borrower);
 
         return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates repayBorrow and reverts on rejection. May emit logs.
-     * @param mToken Asset being repaid
-     * @param payer The address repaying the borrow
-     * @param borrower The address of the borrower
-     * @param actualRepayAmount The amount of underlying being repaid
-     */
-    function repayBorrowVerify(
-        address mToken,
-        address payer,
-        address borrower,
-        uint actualRepayAmount,
-        uint borrowerIndex) external {
-        // Shh - currently unused
-        mToken;
-        payer;
-        borrower;
-        actualRepayAmount;
-        borrowerIndex;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
     }
 
     /**
@@ -472,7 +396,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         address mTokenCollateral,
         address liquidator,
         address borrower,
-        uint repayAmount) external returns (uint) {
+        uint repayAmount) override external view returns (uint) {
         // Shh - currently unused
         liquidator;
 
@@ -500,35 +424,6 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     }
 
     /**
-     * @notice Validates liquidateBorrow and reverts on rejection. May emit logs.
-     * @param mTokenBorrowed Asset which was borrowed by the borrower
-     * @param mTokenCollateral Asset which was used as collateral and will be seized
-     * @param liquidator The address repaying the borrow and seizing the collateral
-     * @param borrower The address of the borrower
-     * @param actualRepayAmount The amount of underlying being repaid
-     */
-    function liquidateBorrowVerify(
-        address mTokenBorrowed,
-        address mTokenCollateral,
-        address liquidator,
-        address borrower,
-        uint actualRepayAmount,
-        uint seizeTokens) external {
-        // Shh - currently unused
-        mTokenBorrowed;
-        mTokenCollateral;
-        liquidator;
-        borrower;
-        actualRepayAmount;
-        seizeTokens;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
-    }
-
-    /**
      * @notice Checks if the seizing of assets should be allowed to occur
      * @param mTokenCollateral Asset which was used as collateral and will be seized
      * @param mTokenBorrowed Asset which was borrowed by the borrower
@@ -541,7 +436,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         address mTokenBorrowed,
         address liquidator,
         address borrower,
-        uint seizeTokens) external returns (uint) {
+        uint seizeTokens) override external returns (uint) {
         // Pausing is a very serious situation - we revert to sound the alarms
         require(!seizeGuardianPaused, "seize is paused");
 
@@ -557,37 +452,13 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         }
 
         // Keep the flywheel moving
+        // Note: We don't update borrower indices here because as part of liquidations
+        //       repayBorrowFresh is called, which in turn calls `borrowAllow`, which updates
+        //       the liquidated borrower's indices.
         updateAndDistributeSupplierRewardsForToken(mTokenCollateral, borrower);
         updateAndDistributeSupplierRewardsForToken(mTokenCollateral, liquidator);
 
         return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates seize and reverts on rejection. May emit logs.
-     * @param mTokenCollateral Asset which was used as collateral and will be seized
-     * @param mTokenBorrowed Asset which was borrowed by the borrower
-     * @param liquidator The address repaying the borrow and seizing the collateral
-     * @param borrower The address of the borrower
-     * @param seizeTokens The number of collateral tokens to seize
-     */
-    function seizeVerify(
-        address mTokenCollateral,
-        address mTokenBorrowed,
-        address liquidator,
-        address borrower,
-        uint seizeTokens) external {
-        // Shh - currently unused
-        mTokenCollateral;
-        mTokenBorrowed;
-        liquidator;
-        borrower;
-        seizeTokens;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
     }
 
     /**
@@ -598,7 +469,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param transferTokens The number of mTokens to transfer
      * @return 0 if the transfer is allowed, otherwise a semi-opaque error code (See ErrorReporter.sol)
      */
-    function transferAllowed(address mToken, address src, address dst, uint transferTokens) external returns (uint) {
+    function transferAllowed(address mToken, address src, address dst, uint transferTokens) override external returns (uint) {
         // Pausing is a very serious situation - we revert to sound the alarms
         require(!transferGuardianPaused, "transfer is paused");
 
@@ -614,26 +485,6 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         updateAndDistributeSupplierRewardsForToken(mToken, dst);
 
         return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates transfer and reverts on rejection. May emit logs.
-     * @param mToken Asset being transferred
-     * @param src The account which sources the tokens
-     * @param dst The account which receives the tokens
-     * @param transferTokens The number of mTokens to transfer
-     */
-    function transferVerify(address mToken, address src, address dst, uint transferTokens) external {
-        // Shh - currently unused
-        mToken;
-        src;
-        dst;
-        transferTokens;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
     }
 
     /*** Liquidity/Liquidation Calculations ***/
@@ -663,7 +514,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      *          account shortfall below collateral requirements)
      */
     function getAccountLiquidity(address account) public view returns (uint, uint, uint) {
-        (Error err, uint liquidity, uint shortfall) = getHypotheticalAccountLiquidityInternal(account, MToken(0), 0, 0);
+        (Error err, uint liquidity, uint shortfall) = getHypotheticalAccountLiquidityInternal(account, MToken(address(0)), 0, 0);
 
         return (uint(err), liquidity, shortfall);
     }
@@ -675,7 +526,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      *          account shortfall below collateral requirements)
      */
     function getAccountLiquidityInternal(address account) internal view returns (Error, uint, uint) {
-        return getHypotheticalAccountLiquidityInternal(account, MToken(0), 0, 0);
+        return getHypotheticalAccountLiquidityInternal(account, MToken(address(0)), 0, 0);
     }
 
     /**
@@ -775,7 +626,7 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
      * @param actualRepayAmount The amount of mTokenBorrowed underlying to convert into mTokenCollateral tokens
      * @return (errorCode, number of mTokenCollateral tokens to be seized in a liquidation)
      */
-    function liquidateCalculateSeizeTokens(address mTokenBorrowed, address mTokenCollateral, uint actualRepayAmount) external view returns (uint, uint) {
+    function liquidateCalculateSeizeTokens(address mTokenBorrowed, address mTokenCollateral, uint actualRepayAmount) override external view returns (uint, uint) {
         /* Read oracle prices for borrowed and collateral markets */
         uint priceBorrowedMantissa = oracle.getUnderlyingPrice(MToken(mTokenBorrowed));
         uint priceCollateralMantissa = oracle.getUnderlyingPrice(MToken(mTokenCollateral));
@@ -927,10 +778,11 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
             return fail(Error.MARKET_ALREADY_LISTED, FailureInfo.SUPPORT_MARKET_EXISTS);
         }
 
-        mToken.isMToken(); // Sanity check to make sure its really a MToken
+        require(mToken.isMToken(), "Must be an MToken"); // Sanity check to make sure its really a MToken
 
-        // Note that isWelled is not in active use anymore
-        markets[address(mToken)] = Market({isListed: true, isWelled: false, collateralFactorMantissa: 0});
+        Market storage newMarket = markets[address(mToken)];
+        newMarket.isListed = true;
+        newMarket.collateralFactorMantissa = 0;
 
         _addMarketInternal(address(mToken));
 
@@ -945,7 +797,6 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
         }
         allMarkets.push(MToken(mToken));
     }
-
 
     /**
       * @notice Set the given borrow caps for the given mToken markets. Borrowing that brings total borrows to or above borrow cap will revert.
@@ -985,6 +836,43 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     }
 
     /**
+      * @notice Set the given supply caps for the given mToken markets. Supplying that brings total supplies to or above supply cap will revert.
+      * @dev Admin or supplyCapGuardian function to set the supply caps. A supply cap of 0 corresponds to unlimited supplying.
+      * @param mTokens The addresses of the markets (tokens) to change the supply caps for
+      * @param newSupplyCaps The new supply cap values in underlying to be set. A value of 0 corresponds to unlimited supplying.
+      */
+    function _setMarketSupplyCaps(MToken[] calldata mTokens, uint[] calldata newSupplyCaps) external {
+        require(msg.sender == admin || msg.sender == supplyCapGuardian, "only admin or supply cap guardian can set supply caps");
+
+        uint numMarkets = mTokens.length;
+        uint numSupplyCaps = newSupplyCaps.length;
+
+        require(numMarkets != 0 && numMarkets == numSupplyCaps, "invalid input");
+
+        for(uint i = 0; i < numMarkets; i++) {
+            supplyCaps[address(mTokens[i])] = newSupplyCaps[i];
+            emit NewSupplyCap(mTokens[i], newSupplyCaps[i]);
+        }
+    }
+
+    /**
+     * @notice Admin function to change the Supply Cap Guardian
+     * @param newSupplyCapGuardian The address of the new Supply Cap Guardian
+     */
+    function _setSupplyCapGuardian(address newSupplyCapGuardian) external {
+        require(msg.sender == admin, "only admin can set supply cap guardian");
+
+        // Save current value for inclusion in log
+        address oldSupplyCapGuardian = supplyCapGuardian;
+
+        // Store supplyCapGuardian with value newSupplyCapGuardian
+        supplyCapGuardian = newSupplyCapGuardian;
+
+        // Emit NewSupplyCapGuardian(OldSupplyCapGuardian, NewSupplyCapGuardian)
+        emit NewSupplyCapGuardian(oldSupplyCapGuardian, newSupplyCapGuardian);
+    }
+
+    /**
      * @notice Admin function to change the Pause Guardian
      * @param newPauseGuardian The address of the new Pause Guardian
      * @return uint 0=success, otherwise a failure. (See enum Error for details)
@@ -1007,26 +895,17 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     }
 
     /**
-     * @notice Admin function to change the amount of gas sent with native token transfers
-     * @param newGasAmount The new gas amount to use on native asset transfers.
-     * @return uint 0=success, otherwise a failure. (See enum Error for details)
+     * @notice Admin function to change the Reward Distributor
+     * @param newRewardDistributor The address of the new Reward Distributor
      */
-    function _setGasAmount(uint16 newGasAmount) public returns (uint) {
-        if (msg.sender != admin) {
-            return fail(Error.UNAUTHORIZED, FailureInfo.SET_GAS_AMOUNT_OWNER_CHECK);
-        }
-        require(newGasAmount >= 2300);
+    function _setRewardDistributor(MultiRewardDistributor newRewardDistributor) public {
+        require(msg.sender == admin, "Unauthorized");
 
-        // Save current value for inclusion in log
-        uint16 oldGasAmount = gasAmount;
+        MultiRewardDistributor oldRewardDistributor = rewardDistributor;
 
-        // Store gasAmount with value gasAmount
-        gasAmount = newGasAmount;
+        rewardDistributor = newRewardDistributor;
 
-        // Emit NewGasAmount(oldGasAmount, newGasAmount)
-        emit NewGasAmount(oldGasAmount, newGasAmount);
-
-        return uint(Error.NO_ERROR);
+        emit NewRewardDistributor(oldRewardDistributor, newRewardDistributor);
     }
 
     function _setMintPaused(MToken mToken, bool state) public returns (bool) {
@@ -1073,293 +952,104 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
     }
 
     /**
-     * @notice Checks caller is admin, or this contract is becoming the new implementation
+     * @notice Sweep ERC-20 tokens from the comptroller to the admin
+     * @param _tokenAddress The address of the token to transfer
+     * @param _amount The amount of tokens to sweep, uint.max means everything
      */
-    function adminOrInitializing() internal view returns (bool) {
-        return msg.sender == admin || msg.sender == comptrollerImplementation;
+    function _rescueFunds(address _tokenAddress, uint _amount) external {
+        require(msg.sender == admin, "Unauthorized");
+
+        IERC20 token = IERC20(_tokenAddress);
+        // Similar to mTokens, if this is uint.max that means "transfer everything"
+        if (_amount == type(uint).max) {
+            token.transfer(admin, token.balanceOf(address(this)));
+        } else {
+            token.transfer(admin, _amount);
+        }
     }
 
     /*** WELL Distribution ***/
 
     /**
-     * @notice Set reward speed for a single market
-     * @param rewardType  0: Well, 1: Glmr
-     * @param mToken Market whose speed to update
-     * @param newSupplyRewardSpeed New supply speed
-     * @param newBorrowRewardSpeed New borrow speed
+     * @notice Call out to the reward distributor to update its supply index and this user's index too
+     * @param mToken The market to synchronize indexes for
+     * @param supplier The supplier to whom rewards are going
      */
-    function setRewardSpeedInternal(uint8 rewardType, MToken mToken, uint newSupplyRewardSpeed, uint newBorrowRewardSpeed) internal {
-        uint currentSupplyRewardSpeed = supplyRewardSpeeds[rewardType][address(mToken)];
-        uint currentBorrowRewardSpeed = borrowRewardSpeeds[rewardType][address(mToken)];
-
-        if (currentSupplyRewardSpeed != 0) {
-            updateRewardSupplyIndex(rewardType, address(mToken));
-        } else if (newSupplyRewardSpeed != 0) {
-            Market storage market = markets[address(mToken)];
-            require(market.isListed, "Market is not listed");
-
-            if (rewardSupplyState[rewardType][address(mToken)].index == 0 &&
-                rewardSupplyState[rewardType][address(mToken)].timestamp == 0) {
-                rewardSupplyState[rewardType][address(mToken)] = RewardMarketState({
-                    index: initialIndexConstant,
-                    timestamp: safe32(getBlockTimestamp(), "block timestamp exceeds 32 bits")
-                });
-            }
+    function updateAndDistributeSupplierRewardsForToken(address mToken, address supplier) internal {
+        if (address(rewardDistributor) != address(0)){
+            rewardDistributor.updateMarketSupplyIndexAndDisburseSupplierRewards(MToken(mToken), supplier, false);
         }
-
-        if (currentBorrowRewardSpeed != 0) {
-            Exp memory borrowIndex = Exp({ mantissa: mToken.borrowIndex() });
-            updateRewardBorrowIndex(rewardType, address(mToken), borrowIndex);
-        } else if (newBorrowRewardSpeed != 0) {
-            Market storage market = markets[address(mToken)];
-            require(market.isListed, "Market is not listed");
-
-            if (rewardBorrowState[rewardType][address(mToken)].index == 0 &&
-                rewardBorrowState[rewardType][address(mToken)].timestamp == 0) {
-                rewardBorrowState[rewardType][address(mToken)] = RewardMarketState({
-                    index: initialIndexConstant,
-                    timestamp: safe32(getBlockTimestamp(), "block timestamp exceeds 32 bits")
-                });
-            }
-
-        }
-
-        if (currentSupplyRewardSpeed != newSupplyRewardSpeed) {
-            supplyRewardSpeeds[rewardType][address(mToken)] = newSupplyRewardSpeed;
-            emit SupplyRewardSpeedUpdated(rewardType, mToken, newSupplyRewardSpeed);
-        }
-
-        if (currentBorrowRewardSpeed != newBorrowRewardSpeed) {
-            borrowRewardSpeeds[rewardType][address(mToken)] = newBorrowRewardSpeed;
-            emit BorrowRewardSpeedUpdated(rewardType, mToken, newBorrowRewardSpeed);
-        }
-    }
-
-    /**
-     * @notice Accrue WELL to the market by updating the supply index
-     * @param rewardType  0: Well, 1: Glmr
-     * @param mToken The market whose supply index to update
-     */
-    function updateRewardSupplyIndex(uint8 rewardType, address mToken) internal {
-        require(rewardType <= 1, "rewardType is invalid");
-        RewardMarketState storage supplyState = rewardSupplyState[rewardType][mToken];
-        uint supplySpeed = supplyRewardSpeeds[rewardType][mToken];
-        uint blockTimestamp = getBlockTimestamp();
-        uint deltaTimestamps = sub_(blockTimestamp, uint(supplyState.timestamp));
-        if (deltaTimestamps > 0 && supplySpeed > 0) {
-            uint supplyTokens = MToken(mToken).totalSupply();
-            uint wellAccrued = mul_(deltaTimestamps, supplySpeed);
-            Double memory ratio = supplyTokens > 0 ? fraction(wellAccrued, supplyTokens) : Double({mantissa: 0});
-            Double memory index = add_(Double({mantissa: supplyState.index}), ratio);
-            rewardSupplyState[rewardType][mToken] = RewardMarketState({
-                index: safe224(index.mantissa, "new index exceeds 224 bits"),
-                timestamp: safe32(blockTimestamp, "block timestamp exceeds 32 bits")
-            });
-        } else if (deltaTimestamps > 0) {
-            supplyState.timestamp = safe32(blockTimestamp, "block timestamp exceeds 32 bits");
-        }
-    }
-
-    /**
-     * @notice Accrue WELL to the market by updating the borrow index
-     * @param rewardType  0: Well, 1: Glmr
-     * @param mToken The market whose borrow index to update
-     */
-    function updateRewardBorrowIndex(uint8 rewardType, address mToken, Exp memory marketBorrowIndex) internal {
-        require(rewardType <= 1, "rewardType is invalid");
-        RewardMarketState storage borrowState = rewardBorrowState[rewardType][mToken];
-        uint borrowSpeed = borrowRewardSpeeds[rewardType][mToken];
-        uint blockTimestamp = getBlockTimestamp();
-        uint deltaTimestamps = sub_(blockTimestamp, uint(borrowState.timestamp));
-        if (deltaTimestamps > 0 && borrowSpeed > 0) {
-            uint borrowAmount = div_(MToken(mToken).totalBorrows(), marketBorrowIndex);
-            uint wellAccrued = mul_(deltaTimestamps, borrowSpeed);
-            Double memory ratio = borrowAmount > 0 ? fraction(wellAccrued, borrowAmount) : Double({mantissa: 0});
-            Double memory index = add_(Double({mantissa: borrowState.index}), ratio);
-            rewardBorrowState[rewardType][mToken] = RewardMarketState({
-                index: safe224(index.mantissa, "new index exceeds 224 bits"),
-                timestamp: safe32(blockTimestamp, "block timestamp exceeds 32 bits")
-            });
-        } else if (deltaTimestamps > 0) {
-            borrowState.timestamp = safe32(blockTimestamp, "block timestamp exceeds 32 bits");
-        }
-    }
-
-    /**
-     * @notice Refactored function to calc and rewards accounts supplier rewards
-     * @param mToken The market to verify the mint against
-     * @param account The acount to whom WELL or GLMR is rewarded
-     */
-    function updateAndDistributeSupplierRewardsForToken(address mToken, address account) internal {
-        for (uint8 rewardType = 0; rewardType <= 1; rewardType++) {
-            updateRewardSupplyIndex(rewardType, mToken);
-            distributeSupplierReward(rewardType, mToken, account);
-        }
-    }
-
-    /**
-     * @notice Calculate WELL/GLMR accrued by a supplier and possibly transfer it to them
-     * @param rewardType  0: Well, 1: Glmr
-     * @param mToken The market in which the supplier is interacting
-     * @param supplier The address of the supplier to distribute WELL to
-     */
-    function distributeSupplierReward(uint8 rewardType, address mToken, address supplier) internal {
-        require(rewardType <= 1, "rewardType is invalid");
-        RewardMarketState storage supplyState = rewardSupplyState[rewardType][mToken];
-        Double memory supplyIndex = Double({mantissa: supplyState.index});
-        Double memory supplierIndex = Double({mantissa: rewardSupplierIndex[rewardType][mToken][supplier]});
-        rewardSupplierIndex[rewardType][mToken][supplier] = supplyIndex.mantissa;
-
-        if (supplierIndex.mantissa == 0 && supplyIndex.mantissa > 0) {
-            supplierIndex.mantissa = initialIndexConstant;
-        }
-
-        Double memory deltaIndex = sub_(supplyIndex, supplierIndex);
-        uint supplierTokens = MToken(mToken).balanceOf(supplier);
-        uint supplierDelta = mul_(supplierTokens, deltaIndex);
-        uint supplierAccrued = add_(rewardAccrued[rewardType][supplier], supplierDelta);
-        rewardAccrued[rewardType][supplier] = supplierAccrued;
-        emit DistributedSupplierReward(rewardType, MToken(mToken), supplier, supplierDelta, supplyIndex.mantissa);
     }
 
    /**
-     * @notice Refactored function to calc and rewards accounts supplier rewards
-     * @param mToken The market to verify the mint against
-     * @param borrower Borrower to be rewarded
+     * @notice Call out to the reward distributor to update its borrow index and this user's index too
+     * @param mToken The market to synchronize indexes for
+     * @param borrower The borrower to whom rewards are going
      */
-    function updateAndDistributeBorrowerRewardsForToken(address mToken, address borrower, Exp memory marketBorrowIndex) internal {
-        for (uint8 rewardType = 0; rewardType <= 1; rewardType++) {
-            updateRewardBorrowIndex(rewardType, mToken, marketBorrowIndex);
-            distributeBorrowerReward(rewardType, mToken, borrower, marketBorrowIndex);
-        }
-    }
-
-    /**
-     * @notice Calculate WELL accrued by a borrower and possibly transfer it to them
-     * @dev Borrowers will not begin to accrue until after the first interaction with the protocol.
-     * @param rewardType  0: Well, 1: Glmr
-     * @param mToken The market in which the borrower is interacting
-     * @param borrower The address of the borrower to distribute WELL to
-     */
-    function distributeBorrowerReward(uint8 rewardType, address mToken, address borrower, Exp memory marketBorrowIndex) internal {
-        require(rewardType <= 1, "rewardType is invalid");
-        RewardMarketState storage borrowState = rewardBorrowState [rewardType][mToken];
-        Double memory borrowIndex = Double({mantissa: borrowState.index});
-        Double memory borrowerIndex = Double({mantissa: rewardBorrowerIndex[rewardType][mToken][borrower]});
-        rewardBorrowerIndex[rewardType][mToken][borrower] = borrowIndex.mantissa;
-
-        if (borrowerIndex.mantissa > 0) {
-            Double memory deltaIndex = sub_(borrowIndex, borrowerIndex);
-            uint borrowerAmount = div_(MToken(mToken).borrowBalanceStored(borrower), marketBorrowIndex);
-            uint borrowerDelta = mul_(borrowerAmount, deltaIndex);
-            uint borrowerAccrued = add_(rewardAccrued[rewardType][borrower], borrowerDelta);
-            rewardAccrued[rewardType][borrower] = borrowerAccrued;
-            emit DistributedBorrowerReward(rewardType, MToken(mToken), borrower, borrowerDelta, borrowIndex.mantissa);
+    function updateAndDistributeBorrowerRewardsForToken(address mToken, address borrower) internal {
+        if (address(rewardDistributor) != address(0)){
+            rewardDistributor.updateMarketBorrowIndexAndDisburseBorrowerRewards(MToken(mToken), borrower, false);
         }
     }
 
     /**
      * @notice Claim all the WELL accrued by holder in all markets
-     * @param holder The address to claim WELL for
      */
-    function claimReward(uint8 rewardType, address payable holder) public {
-        return claimReward(rewardType,holder, allMarkets);
+    function claimReward() public {
+        claimReward(msg.sender, allMarkets);
     }
 
     /**
-     * @notice Claim all the WELL accrued by holder in the specified markets
-     * @param holder The address to claim WELL for
-     * @param mTokens The list of markets to claim WELL in
+     * @notice Claim all the rewards accrued by specified holder in all markets
+     * @param holder The address to claim rewards for
      */
-    function claimReward(uint8 rewardType, address payable holder, MToken[] memory mTokens) public {
-        address payable [] memory holders = new address payable[](1);
+    function claimReward(address holder) public {
+        claimReward(holder, allMarkets);
+    }
+
+    /**
+     * @notice Claim all the rewards accrued by holder in the specified markets
+     * @param holder The address to claim rewards for
+     * @param mTokens The list of markets to claim rewards in
+     */
+    function claimReward(address holder, MToken[] memory mTokens) public {
+        address[] memory holders = new address[](1);
         holders[0] = holder;
-        claimReward(rewardType, holders, mTokens, true, true);
+        claimReward(holders, mTokens, true, true);
     }
 
     /**
-     * @notice Claim all WELL or Glmr accrued by the holders
-     * @param rewardType  0 means Well   1 means Glmr
-     * @param holders The addresses to claim GLMR for
-     * @param mTokens The list of markets to claim GLMR in
-     * @param borrowers Whether or not to claim GLMR earned by borrowing
-     * @param suppliers Whether or not to claim GLMR earned by supplying
+     * @notice Claim all rewards for a specified group of users, tokens, and market sides
+     * @param holders The addresses to claim for
+     * @param mTokens The list of markets to claim in
+     * @param borrowers Whether or not to claim earned by borrowing
+     * @param suppliers Whether or not to claim earned by supplying
      */
-    function claimReward(uint8 rewardType, address payable[] memory holders, MToken[] memory mTokens, bool borrowers, bool suppliers) public payable {
-        require(rewardType <= 1, "rewardType is invalid");
+    function claimReward(address[] memory holders, MToken[] memory mTokens, bool borrowers, bool suppliers) public {
+        require(address(rewardDistributor) != address(0), "No reward distributor configured!");
+
         for (uint i = 0; i < mTokens.length; i++) {
+
+            // Safety check that the supplied mTokens are active/listed
             MToken mToken = mTokens[i];
             require(markets[address(mToken)].isListed, "market must be listed");
-            if (borrowers == true) {
-                Exp memory borrowIndex = Exp({mantissa: mToken.borrowIndex()});
-                updateRewardBorrowIndex(rewardType,address(mToken), borrowIndex);
-                for (uint j = 0; j < holders.length; j++) {
-                    distributeBorrowerReward(rewardType,address(mToken), holders[j], borrowIndex);
-                    rewardAccrued[rewardType][holders[j]] = grantRewardInternal(rewardType, holders[j], rewardAccrued[rewardType][holders[j]]);
-                }
-            }
+
+            // Disburse supply side
             if (suppliers == true) {
-                updateRewardSupplyIndex(rewardType,address(mToken));
-                for (uint j = 0; j < holders.length; j++) {
-                    distributeSupplierReward(rewardType,address(mToken), holders[j]);
-                    rewardAccrued[rewardType][holders[j]] = grantRewardInternal(rewardType, holders[j], rewardAccrued[rewardType][holders[j]]);
+                rewardDistributor.updateMarketSupplyIndex(mToken);
+                for (uint holderIndex = 0; holderIndex < holders.length; holderIndex++) {
+                    rewardDistributor.disburseSupplierRewards(mToken, holders[holderIndex], true);
+                }
+            }
+
+            // Disburse borrow side
+            if (borrowers == true) {
+                rewardDistributor.updateMarketBorrowIndex(mToken);
+                for (uint holderIndex = 0; holderIndex < holders.length; holderIndex++) {
+                    rewardDistributor.disburseBorrowerRewards(mToken, holders[holderIndex], true);
                 }
             }
         }
-    }
-
-    /**
-     * @notice Transfer WELL/GLMR to the user
-     * @dev Note: If there is not enough WELL/GLMR, we do not perform the transfer all.
-     * @param user The address of the user to transfer GLMR to
-     * @param amount The amount of GLMR to (possibly) transfer
-     * @return The amount of GLMR which was NOT transferred to the user
-     */
-    function grantRewardInternal(uint rewardType, address payable user, uint amount) internal nonReentrant returns (uint) {
-        if (rewardType == 0) {
-            Well well = Well(wellAddress);
-            uint wellRemaining = well.balanceOf(address(this));
-            if (amount > 0 && amount <= wellRemaining) {
-                well.transfer(user, amount);
-                return 0;
-            }
-        } else if (rewardType == 1) {
-            uint glmrRemaining = address(this).balance;
-            if (amount > 0 && amount <= glmrRemaining) {
-                (bool success, ) = user.call.value(amount).gas(gasAmount)("");
-                require(success, "Transfer failed");
-                return 0;
-            }
-        }
-        return amount;
-    }
-
-    /*** WELL Distribution Admin ***/
-
-    /**
-     * @notice Transfer WELL to the recipient
-     * @dev Note: If there is not enough WELL, we do not perform the transfer all.
-     * @param recipient The address of the recipient to transfer WELL to
-     * @param amount The amount of WELL to (possibly) transfer
-     */
-    function _grantWell(address payable recipient, uint amount) public {
-        require(adminOrInitializing(), "only admin can grant WELL");
-        uint amountLeft = grantRewardInternal(0, recipient, amount);
-        require(amountLeft == 0, "insufficient WELL for grant");
-        emit WellGranted(recipient, amount);
-    }
-
-    /**
-     * @notice Set reward speed for a single market
-     * @param rewardType 0 = WELL, 1 = GLMR
-     * @param mToken The market whose reward speed to update
-     * @param supplyRewardSpeed New supply reward speed for the market
-     * @param borrowRewardSpeed New borrow reward speed for the market
-     */
-    function _setRewardSpeed(uint8 rewardType, MToken mToken, uint supplyRewardSpeed, uint borrowRewardSpeed) public {
-        require(rewardType <= 1, "rewardType is invalid");
-        require(adminOrInitializing(), "only admin can set reward speed");
-        setRewardSpeedInternal(rewardType, mToken, supplyRewardSpeed, borrowRewardSpeed);
     }
 
     /**
@@ -1373,20 +1063,6 @@ contract Comptroller is ComptrollerVXStorage, ComptrollerInterface, ComptrollerE
 
     function getBlockTimestamp() public view returns (uint) {
         return block.timestamp;
-    }
-
-    /**
-     * @notice Set the WELL token address
-     */
-    function setWellAddress(address newWellAddress) public {
-        require(msg.sender == admin);
-        wellAddress = newWellAddress;
-    }
-
-    /**
-     * @notice payable function needed to receive GLMR
-     */
-    function () payable external {
     }
 
     /**

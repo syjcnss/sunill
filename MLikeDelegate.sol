@@ -1,4 +1,5 @@
-pragma solidity 0.5.17;
+// SPDX-License-Identifier: BSD-3-Clause
+pragma solidity 0.8.17;
 
 import "./MErc20Delegate.sol";
 

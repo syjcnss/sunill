@@ -1,4 +1,5 @@
-pragma solidity 0.5.17;
+// SPDX-License-Identifier: BSD-3-Clause
+pragma solidity 0.8.17;
 
 import "./MErc20.sol";
 
@@ -11,13 +12,13 @@ contract MErc20Delegate is MErc20, MDelegateInterface {
     /**
      * @notice Construct an empty delegate
      */
-    constructor() public {}
+    constructor() {}
 
     /**
      * @notice Called by the delegator on a delegate to initialize it for duty
      * @param data The encoded bytes data for any initialization
      */
-    function _becomeImplementation(bytes memory data) public {
+    function _becomeImplementation(bytes memory data) virtual override public {
         // Shh -- currently unused
         data;
 
@@ -32,7 +33,7 @@ contract MErc20Delegate is MErc20, MDelegateInterface {
     /**
      * @notice Called by the delegator on a delegate to forfeit its responsibility
      */
-    function _resignImplementation() public {
+    function _resignImplementation() virtual override public {
         // Shh -- we don't ever want this hook to be marked pure
         if (false) {
             implementation = address(0);
